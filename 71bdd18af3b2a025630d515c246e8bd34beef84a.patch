@@ -1,0 +1,1755 @@
+From 8fb90c7a6755cec4c1a1bfd1ee2fcfcfd3be7e69 Mon Sep 17 00:00:00 2001
+From: Chris Double <chris.double@double.co.nz>
+Date: Thu, 24 Nov 2011 18:58:15 +1300
+Subject: [PATCH 1/3] Merged mining support (imported from namecoin)
+
+---
+ contrib/merged-mine-proxy |  469 +++++++++++++++++++++++++++++++++++++++++++++
+ src/auxpow.cpp            |  129 +++++++++++++
+ src/auxpow.h              |   84 ++++++++
+ src/db.cpp                |    4 +-
+ src/main.cpp              |  139 +++++++++++++-
+ src/main.h                |   74 +++++---
+ src/makefile.unix         |    4 +-
+ src/rpc.cpp               |  460 ++++++++++++++++++++++++++++++++++++++++++++-
+ 8 files changed, 1324 insertions(+), 39 deletions(-)
+ create mode 100755 contrib/merged-mine-proxy
+ create mode 100644 src/auxpow.cpp
+ create mode 100644 src/auxpow.h
+
+diff --git a/contrib/merged-mine-proxy b/contrib/merged-mine-proxy
+new file mode 100755
+index 0000000..4c38215
+--- /dev/null
++++ b/contrib/merged-mine-proxy
+@@ -0,0 +1,469 @@
++#!/usr/bin/python
++#
++# Copyright (c) 2011 Vince Durham
++# Distributed under the MIT/X11 software license, see the accompanying
++# file COPYING.
++#
++
++import logging
++import argparse
++import os
++import sys
++import traceback
++import json
++import base64
++import socket
++
++from datetime import datetime
++
++from twisted.internet import defer, reactor, threads
++from twisted.web import server, resource
++from twisted.internet.error import ConnectionRefusedError
++import twisted.internet.error
++from urlparse import urlsplit
++import httplib
++import thread
++
++__version__ = '0.2.2'
++
++'''
++merge-mine-proxy
++
++Run behind a pool or a miner to mine a parent chain and a set of auxiliary chains.
++
++Output is in the form:
++
++2011-07-07T00:00:00,solve,1,1,HASH
++
++Where the fields are:
++
++    * UTC date and time in ISO format
++    * The word "solve"
++    * 1 if the proof of work was accepted by the parent chain
++    * 1 if the proof of work was accepted by each aux chain
++    * HASH parent block hash
++
++'''
++
++AUX_UPDATE_INTERVAL = 5
++MERKLE_TREES_TO_KEEP = 24
++
++logger = logging.getLogger('merged-mine-proxy')
++logger.setLevel(logging.DEBUG)
++
++def reverse_chunks(s, l):
++    return ''.join(reversed([s[x:x+l] for x in xrange(0, len(s), l)]))
++
++def getresponse(http, path, postdata, headers):
++    http.request(path, 'POST', postdata, headers)
++    return http.getresponse().read()
++
++class Error(Exception):
++    def __init__(self, code, message, data=''):
++        if not isinstance(code, int):
++            raise TypeError('code must be an int')
++        if not isinstance(message, unicode):
++            raise TypeError('message must be a unicode')
++        self._code, self._message, self._data = code, message, data
++    def __str__(self):
++        return '%i %s %r' % (self._code, self._message, self._data)
++    def _to_obj(self):
++        return {
++            'code': self._code,
++            'message': self._message,
++            'data': self._data,
++        }
++
++class Proxy(object):
++    def __init__(self, url):
++        (schema, netloc, path, query, fragment) = urlsplit(url)
++        auth = None
++        if netloc.find('@') >= 0:
++            (auth, netloc) = netloc.split("@")
++        if path == "":
++            path = "/"
++        self._url = "%s://%s%s" % (schema, netloc, path)
++        self._path = path
++        self._auth = auth
++        self._netloc = netloc
++        self._http = None
++    
++    def callRemote(self, method, *params):
++        try:
++            if self._http is None:
++                (host, port) = self._netloc.split(":")
++                self._http = httplib.HTTPConnection(host, port)
++                try:
++                    self._http.connect()
++                except socket.error:
++                    raise httplib.HTTPException()
++
++            id_ = 0
++            
++            headers = {
++                'Content-Type': 'text/json',
++            }
++            if self._auth is not None:
++                headers['Authorization'] = 'Basic ' + base64.b64encode(self._auth)
++            resp = None
++
++            postdata=json.dumps({
++                'jsonrpc': '2.0',
++                'method': method,
++                'params': params,
++                'id': id_,
++            })
++
++            content = getresponse(self._http, self._path, postdata, headers)
++
++            resp = json.loads(content)
++            
++            if resp['id'] != id_:
++                raise ValueError('invalid id')
++            if 'error' in resp and resp['error'] is not None:
++                raise Error(resp['error']['code'], resp['error']['message'])
++            return resp['result']
++        except httplib.HTTPException:
++            self._http = None
++            logger.error("Could not connect to %s", self._url)
++            raise Error(-32099, u'Could not connect to backend', self._url)
++    
++    def __getattr__(self, attr):
++        if attr.startswith('rpc_'):
++            return lambda *params: self.callRemote(attr[len('rpc_'):], *params)
++        raise AttributeError('%r object has no attribute %r' % (self.__class__.__name__, attr))
++
++class Server(resource.Resource):
++    extra_headers = None
++    
++    def render(self, request):
++        def finish(x):
++            if request._disconnected:
++                return
++            if x is not None:
++                request.write(x)
++            request.finish()
++        
++        def finish_error(fail):
++            if request._disconnected:
++                return
++            request.setResponseCode(500) # won't do anything if already written to
++            request.write('---ERROR---')
++            request.finish()
++            fail.printTraceback()
++        
++        defer.maybeDeferred(resource.Resource.render, self, request).addCallbacks(finish, finish_error)
++        return server.NOT_DONE_YET
++
++    @defer.inlineCallbacks
++    def render_POST(self, request):
++        # missing batching, 1.0 notifications
++        data = request.content.read()
++        
++        if self.extra_headers is not None:
++            for name, value in self.extra_headers.iteritems():
++                request.setHeader(name, value)
++        
++        try:
++            try:
++                req = json.loads(data)
++            except Exception:
++                raise RemoteError(-32700, u'Parse error')
++        except Error, e:
++            # id unknown
++            request.write(json.dumps({
++                'jsonrpc': '2.0',
++                'id': None,
++                'result': None,
++                'error': e._to_obj(),
++            }))
++        
++        id_ = req.get('id', None)
++        
++        try:
++            try:
++                method = req['method']
++                if not isinstance(method, unicode):
++                    raise ValueError()
++                params = req.get('params', [])
++                if not isinstance(params, list):
++                    raise ValueError()
++            except Exception:
++                raise Error(-32600, u'Invalid Request')
++            
++            method_name = 'rpc_' + method
++            if not hasattr(self, method_name):
++                raise Error(-32601, u'Method not found')
++            method_meth = getattr(self, method_name)
++            
++            df = defer.maybeDeferred(method_meth, *params)
++            
++            if id_ is None:
++                return
++            
++            try:
++                result = yield df
++            #except Error, e:
++            #w    raise e
++            except Exception, e:
++                logger.error(str(e))
++                raise Error(-32099, u'Unknown error: ' + str(e))
++            
++            res = json.dumps({
++                'jsonrpc': '2.0',
++                'id': id_,
++                'result': result,
++                'error': None,
++            })
++            request.setHeader('content-length', str(len(res)))
++            request.write(res)
++        except Error, e:
++            res = json.dumps({
++                'jsonrpc': '2.0',
++                'id': id_,
++                'result': None,
++                'error': e._to_obj(),
++            })
++            request.setHeader('content-length', str(len(res)))
++            request.write(res)
++
++class Listener(Server):
++    def __init__(self, parent, auxs, merkle_size, rewrite_target):
++        Server.__init__(self)
++        self.parent = parent
++        self.auxs = auxs
++        self.chain_ids = [None for i in auxs]
++        self.aux_targets = [None for i in auxs]
++        self.merkle_size = merkle_size
++        self.merkle_tree_queue = []
++        self.merkle_trees = {}
++        self.rewrite_target = None
++        if rewrite_target == 1:
++            self.rewrite_target = reverse_chunks("00000000fffffffffffffffffffffffffffffffffffffffffffffffffffffffe", 2)
++        elif rewrite_target == 100:
++            self.rewrite_target = reverse_chunks("00000000028f5c28000000000000000000000000000000000000000000000000", 2)
++        if merkle_size > 255:
++            raise ValueError('merkle size up to 255')
++        self.putChild('', self)
++    
++    def merkle_branch(self, chain_index, merkle_tree):
++        step = self.merkle_size
++        i1 = chain_index
++        j = 0
++        branch = []
++        while step > 1:
++            i = min(i1^1, step-1)
++            branch.append(merkle_tree[i + j])
++            i1 = i1 >> 1
++            j += step
++            step = (step + 1) / 2
++        return branch
++
++    def calc_merkle_index(self, chain):
++        chain_id = self.chain_ids[chain]
++        rand = 0 # nonce
++        rand = (rand * 1103515245 + 12345) & 0xffffffff;
++        rand += chain_id;
++        rand = (rand * 1103515245 + 12345) & 0xffffffff;
++        return rand % self.merkle_size
++
++    @defer.inlineCallbacks
++    def update_auxs(self):
++        # create merkle leaves with arbitrary initial value
++        merkle_leaves = [ ('0' * 63) + ("%02x" % x) for x in range(self.merkle_size) ]
++
++        # ask each aux chain for a block
++        for chain in range(len(self.auxs)):
++            aux_block = (yield self.auxs[chain].rpc_getauxblock())
++            aux_block_hash = aux_block['hash']
++            self.chain_ids[chain] = aux_block['chainid']
++            chain_merkle_index = self.calc_merkle_index(chain)
++            merkle_leaves[chain_merkle_index] = aux_block_hash
++            self.aux_targets[chain] = reverse_chunks(aux_block['target'], 2) # fix endian
++
++        # create merkle tree
++        merkle_tree = (yield self.parent.rpc_buildmerkletree(*merkle_leaves))
++        merkle_root = merkle_tree[-1]
++
++        if not self.merkle_trees.has_key(merkle_root):
++            # remember new tree
++            self.merkle_trees[merkle_root] = merkle_tree
++            self.merkle_tree_queue.append(merkle_root)
++            if len(self.merkle_tree_queue) > MERKLE_TREES_TO_KEEP:
++                # forget one tree
++                old_root = self.merkle_tree_queue.pop(0)
++                del self.merkle_trees[old_root]
++
++    def update_aux_process(self):
++        reactor.callLater(AUX_UPDATE_INTERVAL, self.update_aux_process)
++        self.update_auxs()
++
++    def rpc_getaux(self, data=None):
++        ''' Use this rpc call to get the aux chain merkle root and aux target.  Pool software
++        can then call getworkaux(aux) instead of going through this proxy.  It is enough to call this
++        once a second.
++        '''
++        try:
++            # Get aux based on the latest tree
++            merkle_root = self.merkle_tree_queue[-1]
++            # nonce = 0, one byte merkle size
++            aux = merkle_root + ("%02x000000" % self.merkle_size) + "00000000"
++            result = {'aux': aux}
++
++            if self.rewrite_target:
++                result['aux_target'] = self.rewrite_target
++            else:
++                # Find highest target
++                targets = []
++                targets.extend(self.aux_targets)
++                targets.sort()
++                result['aux_target'] = reverse_chunks(targets[-1], 2) # fix endian
++            return result
++        except Exception:
++            logger.error(traceback.format_exc())
++            raise
++
++    @defer.inlineCallbacks
++    def rpc_getwork(self, data=None):
++        ''' This rpc call generates bitcoin miner compatible work from data received
++        from the aux and parent chains.
++        '''
++        try:
++            if data:
++                # Submit work upstream
++                any_solved = False
++                aux_solved = []
++
++                # get merkle root
++                solution = (yield self.parent.rpc_getworkaux("", data))
++
++                if solution is False:
++                    logger.error("stale work")
++                    defer.returnValue(False)
++                    return
++
++                parent_hash = solution['hash']
++                merkle_root = solution['aux'][:-16] # strip off size and nonce
++                if not self.merkle_trees.has_key(merkle_root):
++                    logger.error("stale merkle root %s", merkle_root)
++                    defer.returnValue(False)
++                    return
++
++                merkle_tree = self.merkle_trees[merkle_root]
++
++                # submit to each aux chain
++                for chain in range(len(self.auxs)):
++                    chain_merkle_index = self.calc_merkle_index(chain)
++                    aux_solved.append(False)
++                    # try submitting if under target
++                    if self.aux_targets[chain] > parent_hash and not chain_merkle_index is None:
++                        branch = self.merkle_branch(chain_merkle_index, merkle_tree)
++                        proof = (
++                            yield self.parent.rpc_getworkaux("", data, chain_merkle_index, *branch))
++                        if proof is False:
++                            logger.error("aux pow request rejected by parent, chain %d", chain)
++                        else:
++                            aux_hash = merkle_tree[chain_merkle_index]
++                            aux_solved[-1] = (
++                                yield self.auxs[chain].rpc_getauxblock(aux_hash, proof['auxpow']))
++                            any_solved = any_solved or aux_solved[-1]
++
++                # submit to parent
++                parent_solved = (yield self.parent.rpc_getworkaux("submit", data))
++                any_solved = any_solved or parent_solved
++
++                logger.info("%s,solve,%s,%s,%s", datetime.utcnow().isoformat(),
++                                            "1" if parent_solved else "0",
++                                            ",".join(["1" if solve else "0" for solve in aux_solved]),
++                                            parent_hash)
++                defer.returnValue(any_solved)
++            else:
++                # Get work based on the latest tree
++                merkle_root = self.merkle_tree_queue[-1]
++                # nonce = 0, one byte merkle size
++                aux = merkle_root + ("%02x000000" % self.merkle_size) + "00000000"
++                work = (yield self.parent.rpc_getworkaux(aux))
++                if self.rewrite_target:
++                    work['target'] = self.rewrite_target
++                else:
++                    # Find highest target
++                    targets = [reverse_chunks(work['target'], 2)] # fix endian
++                    targets.extend(self.aux_targets)
++                    targets.sort()
++                    work['target'] = reverse_chunks(targets[-1], 2) # fix endian
++                defer.returnValue(work)
++        except Exception:
++            # Exceptions here are normally already handled by the rpc functions
++            #logger.debug(traceback.format_exc())
++            raise
++
++def main(args):
++    parent = Proxy(args.parent_url)
++    aux_urls = args.aux_urls or ['http://un:pw@127.0.0.1:8342/']
++    auxs = [Proxy(url) for url in aux_urls]
++    if args.merkle_size is None:
++        for i in range(8):
++            if (1<<i) > len(aux_urls):
++                args.merkle_size = i
++                logger.info('merkle size = %d', i)
++                break
++
++    if len(aux_urls) > args.merkle_size:
++        raise ValueError('the merkle size must be at least as large as the number of aux chains')
++
++    if args.pidfile:
++        pidfile = open(args.pidfile, 'w')
++        pidfile.write(str(os.getpid()))
++        pidfile.close()
++
++    listener = Listener(parent, auxs, args.merkle_size, args.rewrite_target)
++    listener.update_aux_process()
++    reactor.listenTCP(args.worker_port, server.Site(listener))
++
++def run():
++    parser = argparse.ArgumentParser(description='merge-mine-proxy (version %s)' % (__version__,))
++    parser.add_argument('--version', action='version', version=__version__)
++    worker_group = parser.add_argument_group('worker interface')
++    worker_group.add_argument('-w', '--worker-port', metavar='PORT',
++        help='listen on PORT for RPC connections from miners asking for work and providing responses (default: 9992)',
++        type=int, action='store', default=9992, dest='worker_port')
++
++    parent_group = parser.add_argument_group('parent chain (bitcoin) interface')
++    parent_group.add_argument('-p', '--parent-url', metavar='PARENT_URL',
++                              help='connect to the parent RPC at this address (default: http://un:pw@127.0.0.1:8332/)',
++                              type=str, action='store',
++                              default='http://un:pw@127.0.0.1:8332/',
++                              dest='parent_url')
++
++    aux_group = parser.add_argument_group('aux chain (e.g. namecoin) interface(s)')
++    aux_group.add_argument('-x', '--aux-url', metavar='AUX_URL',
++                           help='connect to the aux RPC at this address (default: http://un:pw@127.0.0.1:8342/)',
++                           type=str, action='store', nargs='+',
++                           dest='aux_urls')
++    aux_group.add_argument('-s', '--merkle-size', metavar='SIZE',
++                           help='use these many entries in the merkle tree.  Must be a power of 2. Default is lowest power of 2 greater than number of aux chains.',
++                           type=int, action='store', default=None,
++                           dest='merkle_size')
++
++    parser.add_argument('-r', '--rewrite-target', help='rewrite target difficulty to 1',
++                           action='store_const', const=1, default=False,
++                           dest='rewrite_target')
++    parser.add_argument('-R', '--rewrite-target-100', help='rewrite target difficulty to 100',
++                           action='store_const', const=100, default=False,
++                           dest='rewrite_target')
++
++    parser.add_argument('-i', '--pidfile', metavar='PID', type=str, action='store', default=None, dest='pidfile')
++    parser.add_argument('-l', '--logfile', metavar='LOG', type=str, action='store', default=None, dest='logfile')
++
++    args = parser.parse_args()
++
++    if args.logfile:
++        logger.addHandler(logging.FileHandler(args.logfile))
++    else:
++        logger.addHandler(logging.StreamHandler())
++    
++    reactor.callWhenRunning(main, args)
++    reactor.run()
++
++if __name__ == "__main__":
++    run()
+diff --git a/src/auxpow.cpp b/src/auxpow.cpp
+new file mode 100644
+index 0000000..620504f
+--- /dev/null
++++ b/src/auxpow.cpp
+@@ -0,0 +1,129 @@
++// Copyright (c) 2011 Vince Durham
++// Distributed under the MIT/X11 software license, see the accompanying
++// file license.txt or http://www.opensource.org/licenses/mit-license.php.
++#include "headers.h"
++#include "script.h"
++#include "auxpow.h"
++#include "init.h"
++
++using namespace std;
++using namespace boost;
++
++unsigned char pchMergedMiningHeader[] = { 0xfa, 0xbe, 'm', 'm' } ;
++
++void RemoveMergedMiningHeader(vector<unsigned char>& vchAux)
++{
++    if (vchAux.begin() != std::search(vchAux.begin(), vchAux.end(), UBEGIN(pchMergedMiningHeader), UEND(pchMergedMiningHeader)))
++        throw runtime_error("merged mining aux too short");
++    vchAux.erase(vchAux.begin(), vchAux.begin() + sizeof(pchMergedMiningHeader));
++}
++
++bool CAuxPow::Check(uint256 hashAuxBlock, int nChainID)
++{
++    if (nIndex != 0)
++        return error("AuxPow is not a generate");
++
++    if (!fTestNet && parentBlock.GetChainID() == nChainID)
++        return error("Aux POW parent has our chain ID");
++
++    if (vChainMerkleBranch.size() > 30)
++        return error("Aux POW chain merkle branch too long");
++
++    // Check that the chain merkle root is in the coinbase
++    uint256 nRootHash = CBlock::CheckMerkleBranch(hashAuxBlock, vChainMerkleBranch, nChainIndex);
++    vector<unsigned char> vchRootHash(nRootHash.begin(), nRootHash.end());
++    std::reverse(vchRootHash.begin(), vchRootHash.end()); // correct endian
++
++    // Check that we are in the parent block merkle tree
++    if (CBlock::CheckMerkleBranch(GetHash(), vMerkleBranch, nIndex) != parentBlock.hashMerkleRoot)
++        return error("Aux POW merkle root incorrect");
++
++    const CScript script = vin[0].scriptSig;
++
++    // Check that the same work is not submitted twice to our chain.
++    //
++
++    CScript::const_iterator pcHead =
++        std::search(script.begin(), script.end(), UBEGIN(pchMergedMiningHeader), UEND(pchMergedMiningHeader));
++
++    CScript::const_iterator pc =
++        std::search(script.begin(), script.end(), vchRootHash.begin(), vchRootHash.end());
++
++    if (pc == script.end())
++        return error("Aux POW missing chain merkle root in parent coinbase");
++
++    if (pcHead != script.end())
++    {
++        // Enforce only one chain merkle root by checking that a single instance of the merged
++        // mining header exists just before.
++        if (script.end() != std::search(pcHead + 1, script.end(), UBEGIN(pchMergedMiningHeader), UEND(pchMergedMiningHeader)))
++            return error("Multiple merged mining headers in coinbase");
++        if (pcHead + sizeof(pchMergedMiningHeader) != pc)
++            return error("Merged mining header is not just before chain merkle root");
++    }
++    else
++    {
++        // For backward compatibility.
++        // Enforce only one chain merkle root by checking that it starts early in the coinbase.
++        // 8-12 bytes are enough to encode extraNonce and nBits.
++        if (pc - script.begin() > 20)
++            return error("Aux POW chain merkle root must start in the first 20 bytes of the parent coinbase");
++    }
++
++
++    // Ensure we are at a deterministic point in the merkle leaves by hashing
++    // a nonce and our chain ID and comparing to the index.
++    pc += vchRootHash.size();
++    if (script.end() - pc < 8)
++        return error("Aux POW missing chain merkle tree size and nonce in parent coinbase");
++
++    int nSize;
++    memcpy(&nSize, &pc[0], 4);
++    if (nSize != (1 << vChainMerkleBranch.size()))
++        return error("Aux POW merkle branch size does not match parent coinbase");
++
++    int nNonce;
++    memcpy(&nNonce, &pc[4], 4);
++
++    // Choose a pseudo-random slot in the chain merkle tree
++    // but have it be fixed for a size/nonce/chain combination.
++    //
++    // This prevents the same work from being used twice for the
++    // same chain while reducing the chance that two chains clash
++    // for the same slot.
++    unsigned int rand = nNonce;
++    rand = rand * 1103515245 + 12345;
++    rand += nChainID;
++    rand = rand * 1103515245 + 12345;
++
++    if (nChainIndex != (rand % nSize))
++        return error("Aux POW wrong index");
++
++    return true;
++}
++
++CScript MakeCoinbaseWithAux(unsigned int nBits, unsigned int nExtraNonce, vector<unsigned char>& vchAux)
++{
++    vector<unsigned char> vchAuxWithHeader(UBEGIN(pchMergedMiningHeader), UEND(pchMergedMiningHeader));
++    vchAuxWithHeader.insert(vchAuxWithHeader.end(), vchAux.begin(), vchAux.end());
++
++    // Push OP_2 just in case we want versioning later
++    return CScript() << nBits << nExtraNonce << OP_2 << vchAuxWithHeader;
++}
++
++
++void IncrementExtraNonceWithAux(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce, int64& nPrevTime, vector<unsigned char>& vchAux)
++{
++    // Update nExtraNonce
++    int64 nNow = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
++    if (++nExtraNonce >= 0x7f && nNow > nPrevTime+1)
++    {
++        nExtraNonce = 1;
++        nPrevTime = nNow;
++    }
++
++    pblock->vtx[0].vin[0].scriptSig = MakeCoinbaseWithAux(pblock->nBits, nExtraNonce, vchAux);
++    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
++}
++
++
+diff --git a/src/auxpow.h b/src/auxpow.h
+new file mode 100644
+index 0000000..18fc33f
+--- /dev/null
++++ b/src/auxpow.h
+@@ -0,0 +1,84 @@
++// Copyright (c) 2009-2010 Satoshi Nakamoto
++// Distributed under the MIT/X11 software license, see the accompanying
++// file license.txt or http://www.opensource.org/licenses/mit-license.php.
++#ifndef BITCOIN_AUXPOW_H
++#define BITCOIN_AUXPOW_H
++
++#include "main.h"
++
++class CAuxPow : public CMerkleTx
++{
++public:
++    CAuxPow(const CTransaction& txIn) : CMerkleTx(txIn)
++    {
++    }
++
++    CAuxPow() :CMerkleTx()
++    {
++    }
++
++    // Merkle branch with root vchAux
++    // root must be present inside the coinbase
++    std::vector<uint256> vChainMerkleBranch;
++    // Index of chain in chains merkle tree
++    int nChainIndex;
++    CBlock parentBlock;
++
++    IMPLEMENT_SERIALIZE
++    (
++        nSerSize += SerReadWrite(s, *(CMerkleTx*)this, nType, nVersion, ser_action);
++        nVersion = this->nVersion;
++        READWRITE(vChainMerkleBranch);
++        READWRITE(nChainIndex);
++
++        // Always serialize the saved parent block as header so that the size of CAuxPow
++        // is consistent.
++        nSerSize += SerReadWrite(s, parentBlock, nType | SER_BLOCKHEADERONLY, nVersion, ser_action);
++    )
++
++    bool Check(uint256 hashAuxBlock, int nChainID);
++
++    uint256 GetParentBlockHash()
++    {
++        return parentBlock.GetHash();
++    }
++};
++
++template <typename Stream>
++int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionGetSerializeSize ser_action)
++{
++    if (nVersion & BLOCK_VERSION_AUXPOW)
++    {
++        return ::GetSerializeSize(*auxpow, nType, nVersion);
++    }
++    return 0;
++}
++
++template <typename Stream>
++int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionSerialize ser_action)
++{
++    if (nVersion & BLOCK_VERSION_AUXPOW)
++    {
++        return SerReadWrite(s, *auxpow, nType, nVersion, ser_action);
++    }
++    return 0;
++}
++
++template <typename Stream>
++int ReadWriteAuxPow(Stream& s, boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionUnserialize ser_action)
++{
++    if (nVersion & BLOCK_VERSION_AUXPOW)
++    {
++        auxpow.reset(new CAuxPow());
++        return SerReadWrite(s, *auxpow, nType, nVersion, ser_action);
++    }
++    else
++    {
++        auxpow.reset();
++        return 0;
++    }
++}
++
++extern void RemoveMergedMiningHeader(std::vector<unsigned char>& vchAux);
++extern CScript MakeCoinbaseWithAux(unsigned int nBits, unsigned int nExtraNonce, std::vector<unsigned char>& vchAux);
++#endif
+diff --git a/src/db.cpp b/src/db.cpp
+index f044355..e9a28a9 100644
+--- a/src/db.cpp
++++ b/src/db.cpp
+@@ -5,6 +5,7 @@
+ #include "headers.h"
+ #include "db.h"
+ #include "net.h"
++#include "auxpow.h"
+ #include <boost/filesystem.hpp>
+ #include <boost/filesystem/fstream.hpp>
+ 
+@@ -421,6 +422,7 @@ bool CTxDB::LoadBlockIndex()
+             pindexNew->nTime          = diskindex.nTime;
+             pindexNew->nBits          = diskindex.nBits;
+             pindexNew->nNonce         = diskindex.nNonce;
++            pindexNew->auxpow         = diskindex.auxpow;
+ 
+             // Watch for genesis block
+             if (pindexGenesisBlock == NULL && diskindex.GetBlockHash() == hashGenesisBlock)
+@@ -477,7 +479,7 @@ bool CTxDB::LoadBlockIndex()
+         CBlock block;
+         if (!block.ReadFromDisk(pindex))
+             return error("LoadBlockIndex() : block.ReadFromDisk failed");
+-        if (!block.CheckBlock())
++        if (!block.CheckBlock(pindex->nHeight))
+         {
+             printf("LoadBlockIndex() : *** found bad block at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString().c_str());
+             pindexFork = pindex->pprev;
+diff --git a/src/main.cpp b/src/main.cpp
+index 96270bb..42bf399 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -5,6 +5,7 @@
+ #include "db.h"
+ #include "net.h"
+ #include "init.h"
++#include "auxpow.h"
+ #include "cryptopp/sha.h"
+ #include <boost/filesystem.hpp>
+ #include <boost/filesystem/fstream.hpp>
+@@ -626,6 +627,15 @@ bool CBlock::ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions)
+     return true;
+ }
+ 
++void CBlock::SetAuxPow(CAuxPow* pow)
++{
++    if (pow != NULL)
++        nVersion |=  BLOCK_VERSION_AUXPOW;
++    else
++        nVersion &=  ~BLOCK_VERSION_AUXPOW;
++    auxpow.reset(pow);
++}
++
+ uint256 static GetOrphanRoot(const CBlock* pblock)
+ {
+     // Work back to the first block in the orphan chain
+@@ -1008,12 +1018,12 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
+ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
+ {
+     // Check it again in case a previous version let a bad block in
+-    if (!CheckBlock())
++    if (!CheckBlock(pindex->nHeight))
+         return false;
+ 
+     //// issue here: it doesn't know the version
+-    unsigned int nTxPos = pindex->nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 + GetSizeOfCompactSize(vtx.size());
+-
++    unsigned int nTxPos = pindex->nBlockPos + ::GetSerializeSize(*this, SER_DISK|SER_BLOCKHEADERONLY) + GetSizeOfCompactSize(vtx.size());
++ 
+     map<uint256, CTxIndex> mapUnused;
+     int64 nFees = 0;
+     BOOST_FOREACH(CTransaction& tx, vtx)
+@@ -1246,10 +1256,64 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
+     return true;
+ }
+ 
++// Start accepting AUX POW at this block
++// 
++// Even if we do not accept AUX POW ourselves, we can always be the parent chain.
++ 
++int GetAuxPowStartBlock()
++{
++    if (fTestNet)
++        return 0; // Always on testnet
++    else
++        return INT_MAX; // Never on prodnet
++}
++
++int GetOurChainID()
++{
++    return 0x0003;
++}
++ 
++bool CBlock::CheckProofOfWork(int nHeight) const
++{
++    if (nHeight >= GetAuxPowStartBlock())
++    {
++        // Prevent same work from being submitted twice:
++        // - this block must have our chain ID
++        // - parent block must not have the same chain ID (see CAuxPow::Check)
++        // - index of this chain in chain merkle tree must be pre-determined (see CAuxPow::Check)
++        if (!fTestNet && nHeight != INT_MAX && GetChainID() != GetOurChainID())
++            return error("CheckProofOfWork() : block does not have our chain ID");
+ 
++        if (auxpow.get() != NULL)
++        {
++            if (!auxpow->Check(GetHash(), GetChainID()))
++                return error("CheckProofOfWork() : AUX POW is not valid");
++            // Check proof of work matches claimed amount
++            if (!::CheckProofOfWork(auxpow->GetParentBlockHash(), nBits))
++                return error("CheckProofOfWork() : AUX proof of work failed");
++        }
++        else
++        {
++            // Check proof of work matches claimed amount
++            if (!::CheckProofOfWork(GetHash(), nBits))
++                return error("CheckProofOfWork() : proof of work failed");
++        }
++    }
++    else
++    {
++        if (auxpow.get() != NULL)
++        {
++            return error("CheckProofOfWork() : AUX POW is not allowed at this block");
++        }
+ 
++        // Check proof of work matches claimed amount
++        if (!::CheckProofOfWork(GetHash(), nBits))
++            return error("CheckProofOfWork() : proof of work failed");
++    }
++    return true;
++}
+ 
+-bool CBlock::CheckBlock() const
++bool CBlock::CheckBlock(int nHeight) const
+ {
+     // These are checks that are independent of context
+     // that can be verified before saving an orphan block.
+@@ -1259,7 +1323,7 @@ bool CBlock::CheckBlock() const
+         return error("CheckBlock() : size limits failed");
+ 
+     // Check proof of work matches claimed amount
+-    if (!CheckProofOfWork(GetHash(), nBits))
++    if (!CheckProofOfWork(nHeight))
+         return error("CheckBlock() : proof of work failed");
+ 
+     // Check timestamp
+@@ -1356,7 +1420,7 @@ bool static ProcessBlock(CNode* pfrom, CBlock* pblock)
+         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
+ 
+     // Preliminary checks
+-    if (!pblock->CheckBlock())
++    if (!pblock->CheckBlock(INT_MAX))
+         return error("ProcessBlock() : CheckBlock FAILED");
+ 
+     // If don't already have its previous block, shunt it off to holding area until we get it
+@@ -2711,7 +2775,19 @@ class COrphan
+     }
+ };
+ 
+-
++void CBlock::SetNull()
++{
++    nVersion = BLOCK_VERSION_DEFAULT | (GetOurChainID() * BLOCK_VERSION_CHAIN_START);
++    hashPrevBlock = 0;
++    hashMerkleRoot = 0;
++    nTime = 0;
++    nBits = 0;
++    nNonce = 0;
++    vtx.clear();
++    vMerkleTree.clear();
++    auxpow.reset();
++}
++ 
+ CBlock* CreateNewBlock(CReserveKey& reservekey)
+ {
+     CBlockIndex* pindexPrev = pindexBest;
+@@ -2925,11 +3001,35 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
+     uint256 hash = pblock->GetHash();
+     uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
+ 
+-    if (hash > hashTarget)
+-        return false;
++    CAuxPow *auxpow = pblock->auxpow.get();
++
++    if (auxpow != NULL)
++    {
++        if (!auxpow->Check(hash, pblock->GetChainID()))
++            return error("AUX POW is not valid");
++
++        if (auxpow->GetParentBlockHash() > hashTarget)
++            return error("AUX POW parent hash %s is not under target %s", auxpow->GetParentBlockHash().GetHex().c_str(), hashTarget.GetHex().c_str());
++
++        //// debug print
++        printf("I0coinMiner:\n");
++        printf("AUX proof-of-work found  \n     our hash: %s   \n  parent hash: %s  \n       target: %s\n",
++                hash.GetHex().c_str(),
++                auxpow->GetParentBlockHash().GetHex().c_str(),
++                hashTarget.GetHex().c_str());
++    }
++    else
++    {
++        if (hash > hashTarget)
++            return false;
+ 
++        //// debug print
++        printf("I0coinMiner:\n");
++        printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
++    }
++ 
+     //// debug print
+-    printf("BitcoinMiner:\n");
++    printf("IxcoinMiner:\n");
+     printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
+     pblock->print();
+     printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
+@@ -3152,3 +3252,22 @@ void GenerateBitcoins(bool fGenerate, CWallet* pwallet)
+         }
+     }
+ }
++
++bool CBlockIndex::CheckIndex() const
++{
++    if (nVersion & BLOCK_VERSION_AUXPOW)
++        return CheckProofOfWork(auxpow->GetParentBlockHash(), nBits);
++    else
++        return CheckProofOfWork(GetBlockHash(), nBits);
++}
++
++std::string CBlockIndex::ToString() const
++{
++    return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, hashBlock=%s, hashParentBlock=%s)",
++            pprev, pnext, nFile, nBlockPos, nHeight,
++            hashMerkleRoot.ToString().substr(0,10).c_str(),
++            GetBlockHash().ToString().substr(0,20).c_str(),
++            (auxpow.get() != NULL) ? auxpow->GetParentBlockHash().ToString().substr(0,20).c_str() : "-"
++            );
++}
++
+diff --git a/src/main.h b/src/main.h
+index 3de83a3..f36747d 100644
+--- a/src/main.h
++++ b/src/main.h
+@@ -11,6 +11,7 @@
+ #include "db.h"
+ 
+ #include <list>
++#include <boost/shared_ptr.hpp>
+ 
+ class CBlock;
+ class CBlockIndex;
+@@ -26,6 +27,7 @@
+ class CRequestTracker;
+ class CNode;
+ class CBlockIndex;
++class CAuxPow;
+ 
+ static const unsigned int MAX_BLOCK_SIZE = 1000000;
+ static const unsigned int MAX_BLOCK_SIZE_GEN = MAX_BLOCK_SIZE/2;
+@@ -97,6 +99,7 @@
+ void GenerateBitcoins(bool fGenerate, CWallet* pwallet);
+ CBlock* CreateNewBlock(CReserveKey& reservekey);
+ void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce, int64& nPrevTime);
++void IncrementExtraNonceWithAux(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce, int64& nPrevTime, std::vector<unsigned char>& vchAux);
+ void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash1);
+ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey);
+ bool CheckProofOfWork(uint256 hash, unsigned int nBits);
+@@ -570,7 +573,6 @@ class CTransaction
+         return nMinFee;
+     }
+ 
+-
+     bool ReadFromDisk(CDiskTxPos pos, FILE** pfileRet=NULL)
+     {
+         CAutoFile filein = OpenBlockFile(pos.nFile, 0, pfileRet ? "rb+" : "rb");
+@@ -756,9 +758,28 @@ class CTxIndex
+     int GetDepthInMainChain() const;
+ };
+ 
++template <typename Stream>
++int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionSerialize ser_action);
++
++template <typename Stream>
++int ReadWriteAuxPow(Stream& s, boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionUnserialize ser_action);
++
++template <typename Stream>
++int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionGetSerializeSize ser_action);
+ 
++enum
++{
++    // primary version
++    BLOCK_VERSION_DEFAULT        = (1 << 0),
+ 
++    // modifiers
++    BLOCK_VERSION_AUXPOW         = (1 << 8),
+ 
++    // bits allocated for chain ID
++    BLOCK_VERSION_CHAIN_START    = (1 << 16),
++    BLOCK_VERSION_CHAIN_END      = (1 << 30),
++};
++ 
+ 
+ //
+ // Nodes collect new transactions into a block, hash them into a hash tree,
+@@ -785,6 +806,9 @@ class CBlock
+     // network and disk
+     std::vector<CTransaction> vtx;
+ 
++    // header
++    boost::shared_ptr<CAuxPow> auxpow;
++
+     // memory only
+     mutable std::vector<uint256> vMerkleTree;
+ 
+@@ -804,24 +828,23 @@ class CBlock
+         READWRITE(nBits);
+         READWRITE(nNonce);
+ 
++        nSerSize += ReadWriteAuxPow(s, auxpow, nType, nVersion, ser_action);
++
+         // ConnectBlock depends on vtx being last so it can calculate offset
+-        if (!(nType & (SER_GETHASH|SER_BLOCKHEADERONLY)))
++        if (!(nType & SER_BLOCKHEADERONLY))
+             READWRITE(vtx);
+         else if (fRead)
+             const_cast<CBlock*>(this)->vtx.clear();
+     )
+ 
+-    void SetNull()
++    int GetChainID() const
+     {
+-        nVersion = 1;
+-        hashPrevBlock = 0;
+-        hashMerkleRoot = 0;
+-        nTime = 0;
+-        nBits = 0;
+-        nNonce = 0;
+-        vtx.clear();
+-        vMerkleTree.clear();
+-    }
++        return nVersion / BLOCK_VERSION_CHAIN_START;
++     }
++ 
++    void SetAuxPow(CAuxPow* pow);
++
++    void SetNull();
+ 
+     bool IsNull() const
+     {
+@@ -929,6 +952,8 @@ class CBlock
+         return true;
+     }
+ 
++    bool CheckProofOfWork(int nHeight) const;
++
+     bool ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fReadTransactions=true)
+     {
+         SetNull();
+@@ -944,7 +969,7 @@ class CBlock
+         filein >> *this;
+ 
+         // Check the header
+-        if (!CheckProofOfWork(GetHash(), nBits))
++        if (!CheckProofOfWork(INT_MAX))
+             return error("CBlock::ReadFromDisk() : errors in block header");
+ 
+         return true;
+@@ -978,7 +1003,7 @@ class CBlock
+     bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
+     bool SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew);
+     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos);
+-    bool CheckBlock() const;
++    bool CheckBlock(int nHeight) const;
+     bool AcceptBlock();
+ };
+ 
+@@ -1013,7 +1038,9 @@ class CBlockIndex
+     unsigned int nBits;
+     unsigned int nNonce;
+ 
+-
++    // if this is an aux work block
++    boost::shared_ptr<CAuxPow> auxpow;
++ 
+     CBlockIndex()
+     {
+         phashBlock = NULL;
+@@ -1029,6 +1056,7 @@ class CBlockIndex
+         nTime          = 0;
+         nBits          = 0;
+         nNonce         = 0;
++        auxpow.reset();
+     }
+ 
+     CBlockIndex(unsigned int nFileIn, unsigned int nBlockPosIn, CBlock& block)
+@@ -1046,6 +1074,7 @@ class CBlockIndex
+         nTime          = block.nTime;
+         nBits          = block.nBits;
+         nNonce         = block.nNonce;
++        auxpow         = block.auxpow;
+     }
+ 
+     CBlock GetBlockHeader() const
+@@ -1058,6 +1087,7 @@ class CBlockIndex
+         block.nTime          = nTime;
+         block.nBits          = nBits;
+         block.nNonce         = nNonce;
++        block.auxpow         = auxpow;
+         return block;
+     }
+ 
+@@ -1085,10 +1115,7 @@ class CBlockIndex
+         return (pnext || this == pindexBest);
+     }
+ 
+-    bool CheckIndex() const
+-    {
+-        return CheckProofOfWork(GetBlockHash(), nBits);
+-    }
++    bool CheckIndex() const;
+ 
+     bool EraseBlockFromDisk()
+     {
+@@ -1135,13 +1162,7 @@ class CBlockIndex
+ 
+ 
+ 
+-    std::string ToString() const
+-    {
+-        return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, hashBlock=%s)",
+-            pprev, pnext, nFile, nBlockPos, nHeight,
+-            hashMerkleRoot.ToString().substr(0,10).c_str(),
+-            GetBlockHash().ToString().substr(0,20).c_str());
+-    }
++    std::string ToString() const;
+ 
+     void print() const
+     {
+@@ -1189,6 +1210,7 @@ class CDiskBlockIndex : public CBlockIndex
+         READWRITE(nTime);
+         READWRITE(nBits);
+         READWRITE(nNonce);
++        ReadWriteAuxPow(s, auxpow, nType, this->nVersion, ser_action);
+     )
+ 
+     uint256 GetBlockHash() const
+diff --git a/src/makefile.unix b/src/makefile.unix
+index 7971fea..0e05abc 100644
+--- a/src/makefile.unix
++++ b/src/makefile.unix
+@@ -47,9 +47,11 @@ LIBS+= \
+ DEBUGFLAGS=-g -D__WXDEBUG__
+ CXXFLAGS=-O2 -Wno-invalid-offsetof -Wformat $(DEBUGFLAGS) $(DEFS)
+ HEADERS=headers.h strlcpy.h serialize.h uint256.h util.h key.h bignum.h base58.h \
+-    script.h db.h net.h irc.h keystore.h main.h wallet.h rpc.h uibase.h ui.h noui.h init.h
++    script.h db.h net.h irc.h keystore.h main.h wallet.h rpc.h uibase.h ui.h noui.h \
++    init.h crypter.h auxpow.h
+ 
+ OBJS= \
++    obj/auxpow.o \
+     obj/util.o \
+     obj/script.o \
+     obj/db.o \
+diff --git a/src/rpc.cpp b/src/rpc.cpp
+index 2d706e9..6f245b7 100644
+--- a/src/rpc.cpp
++++ b/src/rpc.cpp
+@@ -7,6 +7,7 @@
+ #include "db.h"
+ #include "net.h"
+ #include "init.h"
++#include "auxpow.h"
+ #undef printf
+ #include <boost/asio.hpp>
+ #include <boost/iostreams/concepts.hpp>
+@@ -299,6 +300,146 @@ Value getblocknumber(const Array& params, bool fHelp)
+     return nBestHeight;
+ }
+ 
++Value BlockToValue(CBlock &block)
++{
++    Object obj;
++    obj.push_back(Pair("hash", block.GetHash().ToString().c_str()));
++    obj.push_back(Pair("version", block.nVersion));
++    obj.push_back(Pair("prev_block", block.hashPrevBlock.ToString().c_str()));
++    obj.push_back(Pair("mrkl_root", block.hashMerkleRoot.ToString().c_str()));
++    obj.push_back(Pair("time", (uint64_t)block.nTime));
++    obj.push_back(Pair("bits", (uint64_t)block.nBits));
++    obj.push_back(Pair("nonce", (uint64_t)block.nNonce));
++    obj.push_back(Pair("n_tx", (int)block.vtx.size()));
++    obj.push_back(Pair("size", (int)::GetSerializeSize(block, SER_NETWORK)));
++
++    Array tx;
++    for (int i = 0; i < block.vtx.size(); i++) {
++    	Object txobj;
++
++	txobj.push_back(Pair("hash", block.vtx[i].GetHash().ToString().c_str()));
++	txobj.push_back(Pair("version", block.vtx[i].nVersion));
++	txobj.push_back(Pair("lock_time", (uint64_t)block.vtx[i].nLockTime));
++	txobj.push_back(Pair("size",
++		(int)::GetSerializeSize(block.vtx[i], SER_NETWORK)));
++
++	Array tx_vin;
++	for (int j = 0; j < block.vtx[i].vin.size(); j++) {
++	    Object vino;
++
++	    Object vino_outpt;
++
++	    vino_outpt.push_back(Pair("hash",
++	    	block.vtx[i].vin[j].prevout.hash.ToString().c_str()));
++	    vino_outpt.push_back(Pair("n", (uint64_t)block.vtx[i].vin[j].prevout.n));
++
++	    vino.push_back(Pair("prev_out", vino_outpt));
++
++	    if (block.vtx[i].vin[j].prevout.IsNull())
++	    	vino.push_back(Pair("coinbase", HexStr(
++			block.vtx[i].vin[j].scriptSig.begin(),
++			block.vtx[i].vin[j].scriptSig.end(), false).c_str()));
++	    else
++	    	vino.push_back(Pair("scriptSig", 
++			block.vtx[i].vin[j].scriptSig.ToString().c_str()));
++	    if (block.vtx[i].vin[j].nSequence != UINT_MAX)
++	    	vino.push_back(Pair("sequence", (uint64_t)block.vtx[i].vin[j].nSequence));
++
++	    tx_vin.push_back(vino);
++	}
++
++	Array tx_vout;
++	for (int j = 0; j < block.vtx[i].vout.size(); j++) {
++	    Object vouto;
++
++	    vouto.push_back(Pair("value",
++	    	(double)block.vtx[i].vout[j].nValue / (double)COIN));
++	    vouto.push_back(Pair("scriptPubKey", 
++		block.vtx[i].vout[j].scriptPubKey.ToString().c_str()));
++
++	    tx_vout.push_back(vouto);
++	}
++
++	txobj.push_back(Pair("in", tx_vin));
++	txobj.push_back(Pair("out", tx_vout));
++
++	tx.push_back(txobj);
++    }
++
++    obj.push_back(Pair("tx", tx));
++
++    Array mrkl;
++    for (int i = 0; i < block.vMerkleTree.size(); i++)
++    	mrkl.push_back(block.vMerkleTree[i].ToString().c_str());
++
++    obj.push_back(Pair("mrkl_tree", mrkl));
++
++    return obj;
++}
++
++Value getblockbycount(const Array& params, bool fHelp)
++{
++    if (fHelp || params.size() != 1)
++        throw runtime_error(
++            "getblockbycount height\n"
++            "Dumps the block existing at specified height");
++
++    int64 height = params[0].get_int64();
++    if (height > nBestHeight)
++        throw runtime_error(
++            "getblockbycount height\n"
++            "Dumps the block existing at specified height");
++
++    string blkname = strprintf("blk%d", height);
++
++    CBlockIndex* pindex;
++    bool found = false;
++
++    for (map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin();
++         mi != mapBlockIndex.end(); ++mi)
++    {
++    	pindex = (*mi).second;
++	if ((pindex->nHeight == height) && (pindex->IsInMainChain())) {
++		found = true;
++		break;
++	}
++    }
++
++    if (!found)
++        throw runtime_error(
++            "getblockbycount height\n"
++            "Dumps the block existing at specified height");
++
++    CBlock block;
++    block.ReadFromDisk(pindex);
++    block.BuildMerkleTree();
++
++    return BlockToValue(block);
++}
++
++
++Value getblockbyhash(const Array& params, bool fHelp)
++{
++    if (fHelp || params.size() != 1)
++        throw runtime_error(
++            "getblockbyhash hash\n"
++            "Dumps the block with specified hash");
++
++    uint256 hash;
++    hash.SetHex(params[0].get_str());
++
++    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
++    if (mi == mapBlockIndex.end())
++        throw JSONRPCError(-18, "hash not found");
++
++    CBlockIndex* pindex = (*mi).second;
++
++    CBlock block;
++    block.ReadFromDisk(pindex);
++    block.BuildMerkleTree();
++
++    return BlockToValue(block);
++}
+ 
+ Value getconnectioncount(const Array& params, bool fHelp)
+ {
+@@ -1526,7 +1667,315 @@ Value getwork(const Array& params, bool fHelp)
+     }
+ }
+ 
++Value getworkaux(const Array& params, bool fHelp)
++{
++    if (fHelp || params.size() < 1)
++        throw runtime_error(
++            "getworkaux <aux>\n"
++            "getworkaux '' <data>\n"
++            "getworkaux 'submit' <data>\n"
++            "getworkaux '' <data> <chain-index> <branch>*\n"
++            " get work with auxiliary data in coinbase, for multichain mining\n"
++            "<aux> is the merkle root of the auxiliary chain block hashes, concatenated with the aux chain merkle tree size and a nonce\n"
++            "<chain-index> is the aux chain index in the aux chain merkle tree\n"
++            "<branch> is the optional merkle branch of the aux chain\n"
++            "If <data> is not specified, returns formatted hash data to work on:\n"
++            "  \"midstate\" : precomputed hash state after hashing the first half of the data\n"
++            "  \"data\" : block data\n"
++            "  \"hash1\" : formatted hash buffer for second hash\n"
++            "  \"target\" : little endian hash target\n"
++            "If <data> is specified and 'submit', tries to solve the block for this (parent) chain and returns true if it was successful."
++            "If <data> is specified and empty first argument, returns the aux merkle root, with size and nonce."
++            "If <data> and <chain-index> are specified, creates an auxiliary proof of work for the chain specified and returns:\n"
++            "  \"aux\" : merkle root of auxiliary chain block hashes\n"
++            "  \"auxpow\" : aux proof of work to submit to aux chain\n"
++            );
++
++    if (vNodes.empty())
++        throw JSONRPCError(-9, "I0Coin is not connected!");
++
++    if (IsInitialBlockDownload())
++        throw JSONRPCError(-10, "I0Coin is downloading blocks...");
++
++    static map<uint256, pair<CBlock*, unsigned int> > mapNewBlock;
++    static vector<CBlock*> vNewBlock;
++    static CReserveKey reservekey(pwalletMain);
++
++    if (params.size() == 1)
++    {
++        static vector<unsigned char> vchAuxPrev;
++        vector<unsigned char> vchAux = ParseHex(params[0].get_str());
++
++        // Update block
++        static unsigned int nTransactionsUpdatedLast;
++        static CBlockIndex* pindexPrev;
++        static int64 nStart;
++        static CBlock* pblock;
++        if (pindexPrev != pindexBest ||
++            vchAux != vchAuxPrev ||
++            (nTransactionsUpdated != nTransactionsUpdatedLast && GetTime() - nStart > 60))
++        {
++            if (pindexPrev != pindexBest)
++            {
++                // Deallocate old blocks since they're obsolete now
++                mapNewBlock.clear();
++                BOOST_FOREACH(CBlock* pblock, vNewBlock)
++                    delete pblock;
++                vNewBlock.clear();
++            }
++            nTransactionsUpdatedLast = nTransactionsUpdated;
++            pindexPrev = pindexBest;
++            vchAuxPrev = vchAux;
++            nStart = GetTime();
++
++            // Create new block
++            pblock = CreateNewBlock(reservekey);
++            if (!pblock)
++                throw JSONRPCError(-7, "Out of memory");
++            vNewBlock.push_back(pblock);
++        }
++
++        // Update nTime
++        pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
++        pblock->nNonce = 0;
++
++        // Update nExtraNonce
++        static unsigned int nExtraNonce = 0;
++        static int64 nPrevTime = 0;
++        IncrementExtraNonceWithAux(pblock, pindexPrev, nExtraNonce, nPrevTime, vchAux);
++
++        // Save
++        mapNewBlock[pblock->hashMerkleRoot] = make_pair(pblock, nExtraNonce);
++
++        // Prebuild hash buffers
++        char pmidstate[32];
++        char pdata[128];
++        char phash1[64];
++        FormatHashBuffers(pblock, pmidstate, pdata, phash1);
++
++        uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
++
++        Object result;
++        result.push_back(Pair("midstate", HexStr(BEGIN(pmidstate), END(pmidstate))));
++        result.push_back(Pair("data",     HexStr(BEGIN(pdata), END(pdata))));
++        result.push_back(Pair("hash1",    HexStr(BEGIN(phash1), END(phash1))));
++        result.push_back(Pair("target",   HexStr(BEGIN(hashTarget), END(hashTarget))));
++        return result;
++    }
++    else
++    {
++        if (params[0].get_str() != "submit" && params[0].get_str() != "")
++            throw JSONRPCError(-8, "<aux> must be the empty string or 'submit' if work is being submitted");
++        // Parse parameters
++        vector<unsigned char> vchData = ParseHex(params[1].get_str());
++        if (vchData.size() != 128)
++            throw JSONRPCError(-8, "Invalid parameter");
++        CBlock* pdata = (CBlock*)&vchData[0];
++
++        // Byte reverse
++        for (int i = 0; i < 128/4; i++)
++            ((unsigned int*)pdata)[i] = CryptoPP::ByteReverse(((unsigned int*)pdata)[i]);
++
++        // Get saved block
++        if (!mapNewBlock.count(pdata->hashMerkleRoot))
++            return false;
++        CBlock* pblock = mapNewBlock[pdata->hashMerkleRoot].first;
++        unsigned int nExtraNonce = mapNewBlock[pdata->hashMerkleRoot].second;
++
++        pblock->nTime = pdata->nTime;
++        pblock->nNonce = pdata->nNonce;
++
++        // Get the aux merkle root from the coinbase
++        CScript script = pblock->vtx[0].vin[0].scriptSig;
++        opcodetype opcode;
++        CScript::const_iterator pc = script.begin();
++        script.GetOp(pc, opcode);
++        script.GetOp(pc, opcode);
++        script.GetOp(pc, opcode);
++        if (opcode != OP_2)
++            throw runtime_error("invalid aux pow script");
++        vector<unsigned char> vchAux;
++        script.GetOp(pc, opcode, vchAux);
++
++        RemoveMergedMiningHeader(vchAux);
++
++        pblock->vtx[0].vin[0].scriptSig = MakeCoinbaseWithAux(pblock->nBits, nExtraNonce, vchAux);
++        pblock->hashMerkleRoot = pblock->BuildMerkleTree();
++
++        if (params.size() > 2)
++        {
++            // Requested aux proof of work
++            int nChainIndex = params[2].get_int();
++
++            CAuxPow pow(pblock->vtx[0]);
++
++            for (int i = 3 ; i < params.size() ; i++)
++            {
++                uint256 nHash;
++                nHash.SetHex(params[i].get_str());
++                pow.vChainMerkleBranch.push_back(nHash);
++            }
++
++            pow.SetMerkleBranch(pblock);
++            pow.nChainIndex = nChainIndex;
++            pow.parentBlock = *pblock;
++            CDataStream ss(SER_GETHASH|SER_BLOCKHEADERONLY);
++            ss << pow;
++            Object result;
++            result.push_back(Pair("auxpow", HexStr(ss.begin(), ss.end())));
++            return result;
++        }
++        else
++        {
++            if (params[0].get_str() == "submit")
++            {
++                return CheckWork(pblock, *pwalletMain, reservekey);
++            }
++            else
++            {
++                Object result;
++                result.push_back(Pair("aux", HexStr(vchAux.begin(), vchAux.end())));
++                result.push_back(Pair("hash", pblock->GetHash().GetHex()));
++                return result;
++            }
++        }
++    }
++}
++
+ 
++Value getauxblock(const Array& params, bool fHelp)
++{
++    if (fHelp || (params.size() != 0 && params.size() != 2))
++        throw runtime_error(
++            "getauxblock [<hash> <auxpow>]\n"
++            " create a new block"
++            "If <hash>, <auxpow> is not specified, returns a new block hash.\n"
++            "If <hash>, <auxpow> is specified, tries to solve the block based on "
++            "the aux proof of work and returns true if it was successful.");
++
++    if (vNodes.empty())
++        throw JSONRPCError(-9, "I0Coin is not connected!");
++
++    if (IsInitialBlockDownload())
++        throw JSONRPCError(-10, "I0Coin is downloading blocks...");
++
++    static map<uint256, CBlock*> mapNewBlock;
++    static vector<CBlock*> vNewBlock;
++    static CReserveKey reservekey(pwalletMain);
++
++    if (params.size() == 0)
++    {
++        // Update block
++        static unsigned int nTransactionsUpdatedLast;
++        static CBlockIndex* pindexPrev;
++        static int64 nStart;
++        static CBlock* pblock;
++        if (pindexPrev != pindexBest ||
++            (nTransactionsUpdated != nTransactionsUpdatedLast && GetTime() - nStart > 60))
++        {
++            if (pindexPrev != pindexBest)
++            {
++                // Deallocate old blocks since they're obsolete now
++                mapNewBlock.clear();
++                BOOST_FOREACH(CBlock* pblock, vNewBlock)
++                    delete pblock;
++                vNewBlock.clear();
++            }
++            nTransactionsUpdatedLast = nTransactionsUpdated;
++            pindexPrev = pindexBest;
++            nStart = GetTime();
++
++            // Create new block with nonce = 0 and extraNonce = 1
++            pblock = CreateNewBlock(reservekey);
++
++            // Update nTime
++            pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
++            pblock->nNonce = 0;
++
++            // Push OP_2 just in case we want versioning later
++            pblock->vtx[0].vin[0].scriptSig = CScript() << pblock->nBits << CBigNum(1) << OP_2;
++            pblock->hashMerkleRoot = pblock->BuildMerkleTree();
++
++            // Sets the version
++            pblock->SetAuxPow(new CAuxPow());
++
++            // Save
++            mapNewBlock[pblock->GetHash()] = pblock;
++
++            if (!pblock)
++                throw JSONRPCError(-7, "Out of memory");
++            vNewBlock.push_back(pblock);
++        }
++
++        uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
++
++        Object result;
++        result.push_back(Pair("target",   HexStr(BEGIN(hashTarget), END(hashTarget))));
++        result.push_back(Pair("hash", pblock->GetHash().GetHex()));
++        result.push_back(Pair("chainid", pblock->GetChainID()));
++        return result;
++    }
++    else
++    {
++        uint256 hash;
++        hash.SetHex(params[0].get_str());
++        vector<unsigned char> vchAuxPow = ParseHex(params[1].get_str());
++        CDataStream ss(vchAuxPow, SER_GETHASH|SER_BLOCKHEADERONLY);
++        CAuxPow* pow = new CAuxPow();
++        ss >> *pow;
++        if (!mapNewBlock.count(hash))
++            return ::error("getauxblock() : block not found");
++
++        CBlock* pblock = mapNewBlock[hash];
++        pblock->SetAuxPow(pow);
++
++        if (!CheckWork(pblock, *pwalletMain, reservekey))
++        {
++            return false;
++        }
++        else
++        {
++            return true;
++        }
++    }
++}
++
++Value buildmerkletree(const Array& params, bool fHelp)
++{
++    if (fHelp || params.size() < 1)
++        throw runtime_error(
++                "buildmerkletree <obj>...\n"
++                " build a merkle tree with the given hex-encoded objects\n"
++                );
++    vector<uint256> vTree;
++    BOOST_FOREACH(const Value& obj, params)
++    {
++        uint256 nHash;
++        nHash.SetHex(obj.get_str());
++        vTree.push_back(nHash);
++    }
++
++    int j = 0;
++    for (int nSize = params.size(); nSize > 1; nSize = (nSize + 1) / 2)
++    {
++        for (int i = 0; i < nSize; i += 2)
++        {
++            int i2 = std::min(i+1, nSize-1);
++            vTree.push_back(Hash(BEGIN(vTree[j+i]),  END(vTree[j+i]),
++                        BEGIN(vTree[j+i2]), END(vTree[j+i2])));
++        }
++        j += nSize;
++    }
++
++    Array result;
++    BOOST_FOREACH(uint256& nNode, vTree)
++    {
++        result.push_back(nNode.GetHex());
++    }
++
++    return result;
++}
++ 
+ 
+ 
+ 
+@@ -1544,7 +1993,9 @@ Value getwork(const Array& params, bool fHelp)
+ {
+     make_pair("help",                  &help),
+     make_pair("stop",                  &stop),
+-	make_pair("getblock",		       &getblock),
++    make_pair("getblock",		       &getblock),
++    make_pair("getblockbycount",        &getblockbycount),
++    make_pair("getblockbyhash",         &getblockbyhash),
+     make_pair("getblockcount",         &getblockcount),
+     make_pair("getblocknumber",        &getblocknumber),
+     make_pair("getconnectioncount",    &getconnectioncount),
+@@ -1579,6 +2030,9 @@ Value getwork(const Array& params, bool fHelp)
+     make_pair("gettransaction",        &gettransaction),
+     make_pair("listtransactions",      &listtransactions),
+     make_pair("getwork",               &getwork),
++    make_pair("getworkaux",            &getworkaux),
++    make_pair("getauxblock",           &getauxblock),
++    make_pair("buildmerkletree",       &buildmerkletree),
+     make_pair("listaccounts",          &listaccounts),
+     make_pair("settxfee",              &settxfee),
+ };
+@@ -1606,6 +2060,8 @@ Value getwork(const Array& params, bool fHelp)
+     "backupwallet",
+     "validateaddress",
+     "getwork",
++    "getworkaux",
++    "getauxblock",
+ };
+ set<string> setAllowInSafeMode(pAllowInSafeMode, pAllowInSafeMode + sizeof(pAllowInSafeMode)/sizeof(pAllowInSafeMode[0]));
+ 
+@@ -2241,7 +2697,9 @@ int CommandLineRPC(int argc, char *argv[])
+         if (strMethod == "sendfrom"               && n > 3) ConvertTo<boost::int64_t>(params[3]);
+         if (strMethod == "listtransactions"       && n > 1) ConvertTo<boost::int64_t>(params[1]);
+         if (strMethod == "listtransactions"       && n > 2) ConvertTo<boost::int64_t>(params[2]);
++        if (strMethod == "getworkaux"             && n > 2) ConvertTo<boost::int64_t>(params[2]);
+         if (strMethod == "listaccounts"           && n > 0) ConvertTo<boost::int64_t>(params[0]);
++	if (strMethod == "getblockbycount"        && n > 0) ConvertTo<boost::int64_t>(params[0]);
+         if (strMethod == "sendmany"               && n > 1)
+         {
+             string s = params[1].get_str();
+-- 
+1.7.5.4
+
+
+From 2c4f3e52ddf5f7cda8ea01ec8adabcbdc7ed1b6a Mon Sep 17 00:00:00 2001
+From: Chris Double <chris.double@double.co.nz>
+Date: Sat, 3 Dec 2011 15:00:02 +1300
+Subject: [PATCH 2/3] fix to merged mining makefile
+
+---
+ src/makefile.unix |    3 +--
+ 1 files changed, 1 insertions(+), 2 deletions(-)
+
+diff --git a/src/makefile.unix b/src/makefile.unix
+index 0e05abc..64874cd 100644
+--- a/src/makefile.unix
++++ b/src/makefile.unix
+@@ -47,8 +47,7 @@ LIBS+= \
+ DEBUGFLAGS=-g -D__WXDEBUG__
+ CXXFLAGS=-O2 -Wno-invalid-offsetof -Wformat $(DEBUGFLAGS) $(DEFS)
+ HEADERS=headers.h strlcpy.h serialize.h uint256.h util.h key.h bignum.h base58.h \
+-    script.h db.h net.h irc.h keystore.h main.h wallet.h rpc.h uibase.h ui.h noui.h \
+-    init.h crypter.h auxpow.h
++    script.h db.h net.h irc.h keystore.h main.h wallet.h rpc.h uibase.h ui.h noui.h init.h auxpow.h
+ 
+ OBJS= \
+     obj/auxpow.o \
+-- 
+1.7.5.4
+
+
+From 3125af63ab0af504c65009580e92b4d712f34472 Mon Sep 17 00:00:00 2001
+From: Chris Double <chris.double@double.co.nz>
+Date: Sat, 3 Dec 2011 16:50:08 +1300
+Subject: [PATCH 3/3] Enable merge mining as an auxiliary chain at block
+ 45,000
+
+---
+ src/main.cpp |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 42bf399..e2db445 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1265,7 +1265,7 @@ int GetAuxPowStartBlock()
+     if (fTestNet)
+         return 0; // Always on testnet
+     else
+-        return INT_MAX; // Never on prodnet
++        return 45000; // Never on prodnet
+ }
+ 
+ int GetOurChainID()
+-- 
+1.7.5.4
+

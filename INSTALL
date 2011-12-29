@@ -1,0 +1,34 @@
+=================
+DEVCOIN-QT INSTALL
+=================
+
+In this directory are some files that you need to have in
+the "currenct directory" when you run devcoind, devcoin,
+or devcoin-qt
+
+The files that must be in the current directory at runtime
+are the receiver_*.csv files.
+
+This program uses boost and curl, you will need the
+development header files of both to compile it and the
+rutime libraries of both to run it.
+
+It also uses Berkeley DB database, you are always free
+to upgrade to newest version but cannot downgrade existing
+databases such as wallets back to an older version.
+
+----------
+COMPILING:
+----------
+
+The file devcoin-qt.pro is a project file for the
+Qt builder application.
+
+Or, you can use the command qmake (or on some
+systems, qmake-qt4) to adapt the Makefile to your
+system then make to do the default of the Makefile,
+which is to make devcoin-qt
+
+You can make the resulting executable ("devcoin-qt")
+smaller by using the strip command.
+
