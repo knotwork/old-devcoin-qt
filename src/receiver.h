@@ -29,7 +29,6 @@ bool getExists(const string& fileName);
 double getFileRandomNumber(const string& dataDirectory, const string& fileName);
 string getFileText(const string& fileName);
 string getHttpsText(const string& address);
-string getHttpsTextPython(const string& address);
 int getInt(const string& integerString);
 string getInternetText(const string& address);
 bool getIsSufficientAmount(vector<string> addressStrings, vector<int64> amounts, const string& dataDirectory, const string& fileName, int height, int64 share, int step=globalStepDefault);
@@ -49,7 +48,6 @@ string getStringByDouble(double doublePrecision);
 string getStringByInt(int integer);
 string getSuffixedFileName(const string& fileName, const string& suffix=string());
 vector<string> getSuffixedFileNames(vector<string> fileNames, const string& suffix=string());
-string getTempDirectoryPath();
 vector<string> getTextLines(const string& text);
 string getTextWithoutWhitespaceByLines(vector<string> lines);
 vector<string> getTokens(const string& text=string(), const string& delimiters=string(" "));
@@ -231,7 +229,7 @@ vector<string> getDirectoryNames(const string& directoryName)
 // Get the directory name of the given file.
 string getDirectoryPath(const string& fileName)
 {
-	string directoryPath = getReplaced((filesystem::path(fileName)).parent_path().string());
+	string directoryPath = (filesystem::path(fileName)).parent_path().string();
 	if (directoryPath == string())
 		return string(".");
 	return directoryPath;
@@ -293,13 +291,19 @@ string getFileText(const string& fileName)
 // Get the entire text of an https page.
 string getHttpsText(const string& address)
 {
+
 	CURL *curl;
+	long http_code;
+	string ret = string();
+
 	curl = curl_easy_init();
 
 	if(curl)
 	{
 		CURLcode code;
 		std::ostringstream oss;
+//		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+//		curl_easy_setopt(curl, CURLOPT_HEADER, 1L);
 		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
 		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -309,63 +313,16 @@ string getHttpsText(const string& address)
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curlWriteFunction);
 		curl_easy_setopt(curl, CURLOPT_URL, address.c_str());
 		code = curl_easy_perform(curl);
+//                printf("Curl-- Response: %d\n", code);
 
-		// always cleanup
-		curl_easy_cleanup(curl);
-
-		if (code == CURLE_OK)
-			return oss.str();
-	}
-
-	return string();
-}
-
-// Get the entire text of an https page.
-string getHttpsTextPython(const string& address)
-{
-
-	string directoryPath = getJoinedPath(getTempDirectoryPath(), string("devcoin_temp_files"));
-	string pythonString = string("python https.py -address ");
-	makeDirectory(directoryPath);
-	vector<string> directoryNames = getDirectoryNames(directoryPath);
-
-	for (int i = 0; i < directoryNames.size(); i++)
-	{
-		string directoryName = directoryNames[i];
-		int firstUnderscoreIndex = directoryName.find("_");
-
-		if (firstUnderscoreIndex != string::npos)
-			if (time(NULL) > getInt(directoryName.substr(0, firstUnderscoreIndex)))
-				remove(getJoinedPath(directoryPath, directoryName).c_str());
-	}
-
-	int startTime = time(NULL);
-	string temporarySuffix = getStringByInt(startTime + globalTimeOutDouble) + string("_");
-	temporarySuffix += getStringByInt(globalDownloadIndex) + string("_.txt");
-	string temporaryName = getJoinedPath(directoryPath, temporarySuffix);
-	int timeToLeave = startTime + globalTimeOut;
-	globalDownloadIndex += 1;
-
-	if (globalDownloadIndex > 987654321)
-		globalDownloadIndex = 0;
-
-	pythonString += address + string(" -output ") + temporaryName;
-	if (std::system(pythonString.c_str()) != 0)
-		return string();
-	while (time(NULL) <= timeToLeave)
-	{
-		sleep(2);
-
-		if (getExists(temporaryName))
-		{
-			string httpsText = getFileText(temporaryName);
-			remove(temporaryName.c_str());
-			return httpsText;
-		}
-	}
-
-	cout << "Could not get the page: " << address << endl;
-	return string();
+		if (code == CURLE_OK) {
+			code = curl_easy_getinfo(curl, CURLINFO_HTTP_CODE, &http_code);
+			// printf("Http Response: %l\n", http_code);
+			if (http_code == 200) ret = oss.str();
+	        }
+        }
+	curl_easy_cleanup(curl);
+	return ret;
 }
 
 // Get an integer from a string.
@@ -385,121 +342,6 @@ int getInt(const string& integerString)
 		cout << "Exception: " << e.what() << endl;
 		return 0;
 	}
-}
-
-// Get the entire text of an internet page.
-string getInternetText(const string& address)
-{
-	try
-	{
-		string host = address.substr();
-		string httpPrefix = string("http://");
-		string path = string();
-
-		if (host.substr(0, httpPrefix.size()) == httpPrefix)
-			host = host.substr(httpPrefix.size());
-
-		int slashIndex = host.find('/');
-
-		if (slashIndex != string::npos)
-		{
-			path = host.substr(slashIndex);
-			host = host.substr(0, slashIndex);
-		}
-
-		asio::io_service io_service;
-
-		// Get a list of endpoints corresponding to the server name.
-		asio::ip::tcp::resolver resolver(io_service);
-		asio::ip::tcp::resolver::query query(host.c_str(), "http");
-		asio::ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
-
-		// Try each endpoint until we successfully establish a connection.
-		asio::ip::tcp::socket socket(io_service);
-		socket.connect(*endpoint_iterator++);
-
-		// Form the request. We specify the "Connection: close" header so that the
-		// server will close the socket after transmitting the response. This will
-		// allow us to treat all data up until the EOF as the content.
-		asio::streambuf request;
-		ostream request_stream(&request);
-		request_stream << "GET " << path << " HTTP/1.0\r\n";
-		request_stream << "Host: " << host << "\r\n";
-		request_stream << "Accept: */*\r\n";
-		request_stream << "Connection: close\r\n\r\n";
-
-		// Send the request.
-		asio::write(socket, request);
-
-		// Read the response status line. The response streambuf will automatically
-		// grow to accommodate the entire line. The growth may be limited by passing
-		// a maximum size to the streambuf constructor.
-		asio::streambuf response;
-		asio::read_until(socket, response, "\r\n");
-
-		// Check that response is OK.
-		istream response_stream(&response);
-		string http_version;
-		response_stream >> http_version;
-		unsigned int status_code;
-		response_stream >> status_code;
-		string status_message;
-		getline(response_stream, status_message);
-		if (!response_stream || http_version.substr(0, 5) != "HTTP/")
-		{
-			cout << "Could not get the page: " << address << endl;
-			cout << "Invalid response\n";
-			return string();
-		}
-		if (status_code != 200)
-		{
-			cout << "Could not get the page: " << address << endl;
-			cout << "Response returned with status code " << status_code << "\n";
-			return string();
-		}
-
-		// Read the response headers, which are terminated by a blank line.
-		asio::read_until(socket, response, "\r\n\r\n");
-
-		// Process the response headers.
-		string header;
-		while (getline(response_stream, header) && header != "\r")
-			;
-//			cout << header << "\n";
-//		cout << "\n";
-
-		stringstream stringStream(stringstream::in | stringstream::out);
-
-		// Write whatever content we already have to output.
-		if (response.size() > 0)
-			stringStream << &response;
-
-		// Read until EOF, writing data to output as we go.
-		system::error_code error;
-		while (asio::read(socket, response, asio::transfer_at_least(1), error))
-			stringStream << &response;
-
-		if (error != asio::error::eof)
-		{
-			cout << "Could not get the page: " << address << endl;
-			return string();
-		}
-
-		string internetText = stringStream.str();
-
-		if (internetText.size() == 0)
-			cout << "Only blank page at: " << address << endl;
-
-		return internetText;
-	}
-	catch (std::exception& e)
-	{
-		cout << "Could not get the page: " << address << endl;
-		cout << "Exception: " << e.what() << "\n";
-		return string();
-	}
-
-	return string();
 }
 
 // Determine if the transactions add up to a share per address for each address.
@@ -569,11 +411,11 @@ string getJoinedPath(const string& directoryPath, const string& fileName)
 // Get the page by the address, be it a file name or hypertext address.
 string getLocationText(const string& address)
 {
-	if (getStartsWith(address, string("https://")))
-		return getHttpsText(address);
-	if (getStartsWith(address, string("http://")))
-		return getInternetText(address);
-	return getFileText(address);
+
+  if (getStartsWith(address, string("https://")) || getStartsWith(address, string("http://")))
+	return getHttpsText(address);
+
+  return getFileText(address);
 }
 
 // Get the pages by the addresses, be they file names or hypertext addresses.
@@ -667,6 +509,7 @@ string getStepFileName(const string& fileName, int height, int step)
 // Get the step output according to the peers listed in a file.
 string getStepOutput(const string& directoryPathInput, const string& fileName, int height, int step)
 {
+
 	string directoryPath = string();
 
 	if (directoryPathInput != string())
@@ -712,6 +555,7 @@ string getStepOutput(const string& directoryPathInput, const string& fileName, i
 // Get the step text by the file name.
 string getStepText(const string& dataDirectory, const string& fileName, int height, int step)
 {
+
 	string stepFileName = getStepFileName(fileName, height, step);
 	if (dataDirectory == string())
 		return getFileText(stepFileName);
@@ -728,9 +572,17 @@ string getStepText(const string& dataDirectory, const string& fileName, int heig
 	{
 		if (stepFileName == string("receiver_0.csv"))
 		{
-			cout << "Downloading receiver_0.csv base file." << endl;
-			stepText = getInternetText("https://raw.github.com/Unthinkingbit/charity/master/receiver_0.csv");
-			writeFileText(stepFileName, stepText);
+			cout << "Downloading receiver_0.csv base file." << directorySubName << endl;
+			stepText = getLocationText("https://raw.github.com/Unthinkingbit/charity/master/receiver_0.csv");
+                        /* This is really the only place we need to create the
+                           received directory,  we could change this to
+                           explictly create it here, and remove the code the
+                           always tried to create it everytime, also we should
+                           be able to change things to not have to pass around
+                           the datadir as calls allready exist to fetch it
+                        */
+			if (getStartsWith(stepText, string("Format,pluribusunum")))
+                           writeFileText(directorySubName, stepText);
 		}
 		else
 			return string();
@@ -815,47 +667,6 @@ vector<string> getSuffixedFileNames(vector<string> fileNames, const string& suff
 	}
 
 	return suffixedFileNames;
-}
-
-string getTempDirectoryPath()
-{
-#	ifdef BOOST_POSIX_API
-		const char* val = 0;
-
-		(val = getenv("TMPDIR" )) || (val = getenv("TMP"    )) || (val = getenv("TEMP"   )) || (val = getenv("TEMPDIR"));
-		filesystem::path p((val!=0) ? val : "/tmp");
-
-		if (p.empty())
-		{
-			cout << "Could not get temp directory path" << endl;
-			return string(".");
-		}
-
-		return p.string();
-
-#   else  // Windows
-		return string(".");
-// Windows code is commented out because I can't test it on my Linux system.
-//		vector<path::value_type> buf(filesystem::GetTempPathW(0, NULL));
-
-//		if (buf.empty() || filesystem::GetTempPathW(buf.size(), &buf[0])==0)
-//		{
-//			cout << "Could not get temp directory path" << endl;
-//			return string(".");
-//		}
-
-//		buf.pop_back();
-
-//		filesystem::path p(buf.begin(), buf.end());
-
-//		if (!filesystem::is_directory(p)))
-//		{
-//			cout << "Could not get temp directory path" << endl;
-//			return string(".");
-//		}
-
-//		return p.string();
-#   endif
 }
 
 // Get all the lines of text of a text.
