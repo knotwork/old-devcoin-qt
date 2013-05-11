@@ -516,18 +516,18 @@ string getStepOutput(const string& directoryPathInput, const string& fileName, i
 		directoryPath = getJoinedPath(directoryPathInput, fileName.substr(0, fileName.rfind('.')));
 
 	// To fix wrong receiver file problem and old receiver chain problem.
-	string stepFileName = getStepFileName(fileName, height, step);
-	if (stepFileName == string("receiver_1.csv"))
-	{
-		if (getExists(stepFileName))
-			writeFileTextByDirectory(directoryPath, stepFileName, getFileText(stepFileName));
-	}
+//	string stepFileName = getStepFileName(fileName, height, step);
+//	if (stepFileName == string("receiver_1.csv"))
+//	{
+//		if (getExists(stepFileName))
+//			writeFileTextByDirectory(directoryPath, stepFileName, getFileText(stepFileName));
+//	}
 
-	if (stepFileName == string("receiver_2.csv"))
-	{
-		if (getExists(stepFileName))
-			writeFileTextByDirectory(directoryPath, stepFileName, getFileText(stepFileName));
-	}
+//	if (stepFileName == string("receiver_2.csv"))
+//	{
+//		if (getExists(stepFileName))
+//			writeFileTextByDirectory(directoryPath, stepFileName, getFileText(stepFileName));
+//	}
 
 	string stepText = getStepText(directoryPath, fileName, height, step);
 
@@ -573,7 +573,15 @@ string getStepText(const string& dataDirectory, const string& fileName, int heig
 		if (stepFileName == string("receiver_0.csv"))
 		{
 			cout << "Downloading receiver_0.csv base file." << directorySubName << endl;
-			stepText = getLocationText("https://raw.github.com/Unthinkingbit/charity/master/receiver_0.csv");
+			string peerText = string("_beginpeers\n");
+			peerText += string("http://galaxies.mygamesonline.org/receiver.csv\n");
+			peerText += string("http://devcoinpool.btc-music.com/receiver/receiver.csv\n");
+			peerText += string("http://devcoinblockexplorer.info/receiver/receiver.csv\n");
+			peerText += string("http://devtome.com/files/receiver.csv\n");
+			peerText += string("http://devcoin.darkgamex.ch/receiver.csv\n");
+			peerText += string("_endpeers\n");
+			stepText = getCommonOutputByText(peerText, string("0"));
+//			stepText = getLocationText("https://raw.github.com/Unthinkingbit/charity/master/receiver_0.csv");
                         /* This is really the only place we need to create the
                            received directory,  we could change this to
                            explictly create it here, and remove the code the
