@@ -1130,11 +1130,11 @@ void MapPort(bool fMapPort)
 
 
 static const char *strDNSSeed[] = {
-"dvcstable01.devcoin.org",      // 198.154.60.183:52333
-"dvcstable02.devcoin.org",      // 198.154.60.61:52333
-"dvcstable03.devcoin.org",      // 108.61.57.117:52333
-"dvcstable04.devcoin.org",      // 5.9.233.104:52333
-"dvcstable05.devcoin.org",      // ??? Need this one ???
+"dvcstable01.dvcnode.org",      // 198.154.60.183:52333
+"dvcstable02.dvcnode.org",      // 198.154.60.61:52333
+"dvcstable03.dvcnode.org",      // 108.61.57.117:52333
+"dvcstable04.dvcnode.org",      // 5.9.233.104:52333
+"dvcstable05.dvcnode.org",      // ??? Need this one ???
 "node01.dvcnode.com",   // The dvcnode.com ones
 "node02.dvcnode.com",   // are Amazon instances
 "node03.dcvnode.com",   // run by Shattienator
