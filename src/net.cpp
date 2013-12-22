@@ -1149,6 +1149,8 @@ static const char *strDNSSeed[] = {
 "dvcstable03.devtome.com",      // 108.61.57.117:52333
 "dvcstable04.devtome.com",      // 5.9.233.104:52333
 "dvcstable05.devtome.com",      // ??? Need this one ???
+"dvcstable06.devtome.com",      // ??? Need this one ???
+"dvcstable07.devtome.com",      // ??? Need this one ???
 };
 
 
